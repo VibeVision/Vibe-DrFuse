@@ -57,4 +57,38 @@ class DrFuseModel(nn.Module):
 
         self.domain_classifier = nn.Sequential(
             nn.Linear(hidden_size, hidden_size//2),
-            
+            nn.ReLU(),
+            nn.Linear(hidden_size//2, 1)
+        )
+        self.attn_proj = nn.Linear(hidden_size, (2+num_classes)*hidden_size)
+        self.final_pred_fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x, img, seq_lengths, pairs, grl_lambda):
+        feat_ehr_shared, feat_ehr_distinct, pred_ehr = self.ehr_model(x, seq_lengths)
+        feat_cxr = self.cxr_model_feat(img)
+        feat_cxr_shared = self.cxr_model_shared(feat_cxr)
+        feat_cxr_distinct = self.cxr_model_spec(feat_cxr)
+
+        # get shared feature
+        pred_cxr = self.cxr_model_linear(feat_cxr_distinct).sigmoid()
+
+        feat_ehr_shared = self.shared_project(feat_ehr_shared)
+        feat_cxr_shared = self.shared_project(feat_cxr_shared)
+
+        pairs = pairs.unsqueeze(1)
+
+        h1 = feat_ehr_shared
+        h2 = feat_cxr_shared
+        term1 = torch.stack([h1+h2, h1+h2, h1, h2], dim=2)
+        term2 = torch.stack([torch.zeros_like(h1), torch.zeros_like(h1), h1, h2], dim=2)
+        feat_avg_shared = torch.logsumexp(term1, dim=2) - torch.logsumexp(term2, dim=2)
+
+        feat_avg_shared = pairs * feat_avg_shared + (1 - pairs) * feat_ehr_shared
+        pred_shared = self.fuse_model_shared(feat_avg_shared).sigmoid()
+
+        # Disease-wise Attention
+        attn_input = torch.stack([feat_ehr_distinct, feat_avg_shared, feat_cxr_distinct], dim=1)
+        qkvs = self.attn_proj(attn_input)
+        q, v, *k = qkvs.chunk(2+self.num_classes, dim=-1)
+
+        # compu
