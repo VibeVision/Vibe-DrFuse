@@ -201,3 +201,82 @@ class DrFuseTrainer(pl.LightningModule):
 
         # return self._compute_masked_pred_loss(out['pred_final'], y, torch.ones_like(y[:, 0]))
         return self._compute_masked_pred_loss(pred_final, y, torch.ones_like(y[:, 0]))
+
+    def on_validation_epoch_end(self):
+        for name in ['final', 'ehr', 'cxr']:
+            y_gt = torch.concat(self.val_labels, dim=0)
+            preds = torch.concat(self.val_preds[name], dim=0)
+            if name == 'cxr':
+                pairs = torch.concat(self.val_pairs, dim=0)
+                y_gt = y_gt[pairs==1, :]
+                preds = preds[pairs==1, :]
+
+            mlaps = multilabel_average_precision(preds, y_gt.long(), num_labels=y_gt.shape[1], average=None)
+            mlroc = multilabel_auroc(preds, y_gt.long(), num_labels=y_gt.shape[1], average=None)
+
+            if name == 'final':
+                self.log('Val_PRAUC', mlaps.mean(), logger=False, prog_bar=True)
+                self.log('Val_AUROC', mlroc.mean(), logger=False, prog_bar=True)
+
+            log_dict = {
+                'step': float(self.current_epoch),
+                f'val_PRAUC_avg_over_dxs/{name}': mlaps.mean(),
+                f'val_AUROC_avg_over_dxs/{name}': mlroc.mean(),
+            }
+            for i in range(mlaps.shape[0]):
+                log_dict[f'val_PRAUC_per_dx_{name}/{self.label_names[i]}'] = mlaps[i]
+                log_dict[f'val_AUROC_per_dx_{name}/{self.label_names[i]}'] = mlroc[i]
+
+            self.log_dict(log_dict)
+
+        for k in self.val_preds:
+            self.val_preds[k].clear()
+        self.val_pairs.clear()
+        self.val_labels.clear()
+
+    def test_step(self, batch, batch_idx):
+        x, img, y, seq_lengths, pairs = self._get_batch_data(batch)
+        out = self.model(x, img, seq_lengths, pairs, self._get_alignment_lambda())
+        if self.hparams.attn_fusion == 'avg':
+            perd_final = (out['pred_ehr'] + out['pred_cxr'] + out['pred_shared']) / 3
+            pred_final = ((1 - pairs.unsqueeze(1)) * (out['pred_ehr'] + out['pred_shared']) / 2 +
+                          pairs.unsqueeze(1) * perd_final)
+        else:
+            pred_final =  out['pred_final']
+
+        self.test_preds.append(pred_final)
+        self.test_labels.append(y)
+        self.test_pairs.append(pairs)
+        self.test_attns.append(out['attn_weights'])
+
+        for k in self.test_feats:
+            self.test_feats[k].append(out[k].cpu())
+
+
+    def on_test_epoch_end(self):
+        y_gt = torch.concat(self.test_labels, dim=0)
+        preds = torch.concat(self.test_preds, dim=0)
+        pairs = torch.concat(self.test_pairs, dim=0)
+        attn_weights = torch.concat(self.test_attns, dim=0)
+        mlaps = multilabel_average_precision(preds, y_gt.long(), num_labels=y_gt.shape[1], average=None)
+        mlroc = multilabel_auroc(preds, y_gt.long(), num_labels=y_gt.shape[1], average=None)
+        self.test_results = {
+            'y_gt': y_gt.cpu(),
+            'preds': preds.cpu(),
+            'pairs': pairs.cpu(),
+            'mlaps': mlaps.cpu(),
+            'mlroc': mlroc.cpu(),
+            'prauc': mlaps.mean().item(),
+            'auroc': mlroc.mean().item(),
+            'attn_weight': attn_weights.cpu()
+        }
+        for k in self.test_feats:
+            self.test_results[k] = torch.concat(self.test_feats[k], dim=0)
+            self.test_feats[k].clear()
+        self.test_labels.clear()
+        self.test_preds.clear()
+        self.test_pairs.clear()
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.wd)
+        return optimizer
