@@ -91,4 +91,36 @@ class DrFuseModel(nn.Module):
         qkvs = self.attn_proj(attn_input)
         q, v, *k = qkvs.chunk(2+self.num_classes, dim=-1)
 
-        # compu
+        # compute query vector
+        q_mean = pairs * q.mean(dim=1) + (1-pairs) * q[:, :-1].mean(dim=1)
+
+        # compute attention weighting
+        ks = torch.stack(k, dim=1)
+        attn_logits = torch.einsum('bd,bnkd->bnk', q_mean, ks)
+        attn_logits = attn_logits / math.sqrt(q.shape[-1])
+
+        # filter out non-paired
+        attn_mask = torch.ones_like(attn_logits)
+        attn_mask[pairs.squeeze()==0, :, -1] = 0
+        attn_logits = attn_logits.masked_fill(attn_mask == 0, float('-inf'))
+        attn_weights = F.softmax(attn_logits, dim=-1)
+
+        # get final class-specific representation and prediction
+        feat_final = torch.matmul(attn_weights, v)
+        pred_final = self.final_pred_fc(feat_final)
+        pred_final = torch.diagonal(pred_final, dim1=1, dim2=2).sigmoid()
+
+        outputs = {
+            'feat_ehr_shared': feat_ehr_shared,
+            'feat_cxr_shared': feat_cxr_shared,
+            'feat_ehr_distinct': feat_ehr_distinct,
+            'feat_cxr_distinct': feat_cxr_distinct,
+            'feat_final': feat_final,
+            'pred_final': pred_final,
+            'pred_shared': pred_shared,
+            'pred_ehr': pred_ehr,
+            'pred_cxr': pred_cxr,
+            'attn_weights': attn_weights,
+        }
+
+        return outputs
